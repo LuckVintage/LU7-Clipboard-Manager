@@ -106,7 +106,7 @@ class ClipboardManager: ObservableObject {
                 return
             }
             
-            if let items = pasteboard.pasteboardItems, let firstItem = items.first {
+            if let items = pasteboard.pasteboardItems, items.first != nil {
                 if let str = pasteboard.string(forType: .string) {
                     addToHistory(ClipboardEntry(content: .text(str), date: Date()))
                 } else if let image = NSImage(pasteboard: pasteboard) {
@@ -251,11 +251,12 @@ struct ContentView: View {
                         .padding(.vertical, 4)
                         .id(entry)
                     }
+                    
                     .id(refreshToggle)
-                    .onChange(of: clipboard.filteredHistory) { _ in
+                    .onChange(of: clipboard.filteredHistory) { _, newValue in
                         refreshToggle.toggle()
                         DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
-                            if let first = clipboard.filteredHistory.first {
+                            if let first = newValue.first {
                                 proxy.scrollTo(first, anchor: .top)
                             }
                         }
@@ -269,6 +270,11 @@ struct ContentView: View {
                     }
                 }
                 .frame(minWidth: 400, minHeight: 550)
+                .cornerRadius(20)
+                .overlay( /// apply a rounded border
+                    RoundedRectangle(cornerRadius: 20)
+                        .stroke(lineWidth: 0)
+                )
             }
             .padding()
 
@@ -382,3 +388,4 @@ struct ClipboardManagerApp: App {
         }
     }
 }
+
