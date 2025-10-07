@@ -62,50 +62,88 @@ extension ClipboardContent {
 struct ClipboardEntry: Codable, Hashable {
     let content: ClipboardContent
     let date: Date
+    var pinned: Bool = false
 }
 
 class ClipboardManager: ObservableObject {
     @Published var history: [ClipboardEntry] = []
     @Published var filterText: String = ""
-    @Published var justCopied = false // For animation trigger
+    @Published var justCopied = false
     @Published var maxHistoryLength: Int = 50
     @Published var showSettingsSheet = false
-    
+    @Published var showClearAllConfirmation = false
+    @Published var autoDeleteDays: Int = 0
+    @Published var autoDeleteCount: Int = 0
+
     private let pasteboard = NSPasteboard.general
     private var changeCount: Int
     private var timer: Timer?
-    
+
     private let historyKey = "clipboardHistory"
     private let maxLengthKey = "maxHistoryLength"
-    
+    private let autoDeleteDaysKey = "autoDeleteDays"
+    private let autoDeleteCountKey = "autoDeleteCount"
+
     private var ignoreNextChange = false
-    
+
     init() {
         self.changeCount = pasteboard.changeCount
         loadHistory()
         loadMaxHistoryLength()
+        loadAutoDeleteDays()
+        loadAutoDeleteCount()
+        pruneExpiredEntries()
     }
-    
+
     func startMonitoring() {
         timer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { _ in
             self.checkClipboard()
         }
     }
-    
+
     func stopMonitoring() {
         timer?.invalidate()
         timer = nil
     }
-    
+
+    func pruneExpiredEntries() {
+        if autoDeleteDays > 0 {
+            let cutoff = Calendar.current.date(byAdding: .day, value: -autoDeleteDays, to: Date()) ?? Date()
+            history.removeAll { entry in
+                entry.pinned == false && entry.date < cutoff
+            }
+        }
+        if autoDeleteCount > 0 {
+            var nonPinnedIndices: [Int] = []
+            for (idx, entry) in history.enumerated() {
+                if entry.pinned == false { nonPinnedIndices.append(idx) }
+            }
+            let excess = max(0, nonPinnedIndices.count - autoDeleteCount)
+            if excess > 0 {
+                var removed = 0
+                var i = history.count - 1
+                while removed < excess && i >= 0 {
+                    if history[i].pinned == false {
+                        history.remove(at: i)
+                        removed += 1
+                    }
+                    if i == 0 { break }
+                    i -= 1
+                }
+            }
+        }
+        saveHistory()
+    }
+
     private func checkClipboard() {
         if pasteboard.changeCount != changeCount {
             changeCount = pasteboard.changeCount
-            
+
             if ignoreNextChange {
                 ignoreNextChange = false
                 return
             }
-            
+
             if let items = pasteboard.pasteboardItems, items.first != nil {
                 if let str = pasteboard.string(forType: .string) {
                     addToHistory(ClipboardEntry(content: .text(str), date: Date()))
@@ -119,20 +157,37 @@ class ClipboardManager: ObservableObject {
             }
         }
     }
-    
+
     private func addToHistory(_ newEntry: ClipboardEntry) {
-        if history.first?.content != newEntry.content {
-            history.insert(newEntry, at: 0)
-            if history.count > maxHistoryLength {
-                history.removeLast()
-            }
-            saveHistory()
+        if let first = history.first, first.pinned == false, first.content == newEntry.content {
+            return
         }
+        if let idx = history.firstIndex(where: { $0.content == newEntry.content && $0.pinned == false }) {
+            var moved = history.remove(at: idx)
+            moved = ClipboardEntry(content: moved.content, date: Date(), pinned: false)
+            let insertIndex = history.prefix { $0.pinned }.count
+            history.insert(moved, at: insertIndex)
+        } else {
+            let insertIndex = history.prefix { $0.pinned }.count
+            history.insert(newEntry, at: insertIndex)
+        }
+        if history.count > maxHistoryLength {
+            var i = history.count - 1
+            while history.count > maxHistoryLength && i >= 0 {
+                if history[i].pinned == false {
+                    history.remove(at: i)
+                }
+                if i == 0 { break }
+                i -= 1
+            }
+        }
+        saveHistory()
+        pruneExpiredEntries()
     }
-    
+
     func copyToClipboard(_ entry: ClipboardEntry) {
         ignoreNextChange = true
-        
+
         pasteboard.clearContents()
         switch entry.content {
         case .text(let str):
@@ -142,7 +197,7 @@ class ClipboardManager: ObservableObject {
                 pasteboard.writeObjects([image])
             }
         }
-        
+
         justCopied = true
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
             withAnimation {
@@ -150,18 +205,20 @@ class ClipboardManager: ObservableObject {
             }
         }
     }
-    
+
     func saveHistory() {
         do {
             let encoder = JSONEncoder()
             let data = try encoder.encode(history)
             UserDefaults.standard.set(data, forKey: historyKey)
             UserDefaults.standard.set(maxHistoryLength, forKey: maxLengthKey)
+            UserDefaults.standard.set(autoDeleteDays, forKey: autoDeleteDaysKey)
+            UserDefaults.standard.set(autoDeleteCount, forKey: autoDeleteCountKey)
         } catch {
             print("Failed to save clipboard history: \(error)")
         }
     }
-    
+
     private func loadHistory() {
         guard let data = UserDefaults.standard.data(forKey: historyKey) else { return }
         do {
@@ -172,26 +229,66 @@ class ClipboardManager: ObservableObject {
             print("Failed to load clipboard history: \(error)")
         }
     }
-    
+
     private func loadMaxHistoryLength() {
         let stored = UserDefaults.standard.integer(forKey: maxLengthKey)
         if stored >= 10 {
             maxHistoryLength = stored
         }
     }
-    
-    var filteredHistory: [ClipboardEntry] {
-        if filterText.isEmpty {
-            return history
+
+    private func loadAutoDeleteDays() {
+        let stored = UserDefaults.standard.integer(forKey: autoDeleteDaysKey)
+        if stored >= 0 {
+            autoDeleteDays = stored
         }
-        return history.filter {
-            switch $0.content {
-            case .text(let str):
-                return str.localizedCaseInsensitiveContains(filterText)
-            case .image(_):
-                return "[Image]".localizedCaseInsensitiveContains(filterText)
+    }
+    
+    private func loadAutoDeleteCount() {
+        let stored = UserDefaults.standard.integer(forKey: autoDeleteCountKey)
+        if stored >= 0 {
+            autoDeleteCount = stored
+        }
+    }
+
+    var filteredHistory: [ClipboardEntry] {
+        let base = history
+        let filtered: [ClipboardEntry]
+        if filterText.isEmpty {
+            filtered = base
+        } else {
+            filtered = base.filter {
+                switch $0.content {
+                case .text(let str):
+                    return str.localizedCaseInsensitiveContains(filterText)
+                case .image(_):
+                    return "[Image]".localizedCaseInsensitiveContains(filterText)
+                }
             }
         }
+        return filtered.sorted { lhs, rhs in
+            if lhs.pinned != rhs.pinned { return lhs.pinned && !rhs.pinned }
+            return lhs.date > rhs.date
+        }
+    }
+
+    func togglePin(_ entry: ClipboardEntry) {
+        if let idx = history.firstIndex(of: entry) {
+            history[idx].pinned.toggle()
+            saveHistory()
+        }
+    }
+
+    func deleteEntry(_ entry: ClipboardEntry) {
+        if let idx = history.firstIndex(of: entry) {
+            history.remove(at: idx)
+            saveHistory()
+        }
+    }
+
+    func clearAll() {
+        history.removeAll()
+        saveHistory()
     }
 }
 
@@ -220,6 +317,16 @@ struct ContentView: View {
                     }
                     .buttonStyle(PlainButtonStyle())
                     .help("Settings")
+
+                    Button {
+                        clipboard.showClearAllConfirmation = true
+                    } label: {
+                        Image(systemName: "trash")
+                            .imageScale(.large)
+                    }
+                    .buttonStyle(PlainButtonStyle())
+                    .help("Clear All")
+                    .disabled(clipboard.history.isEmpty)
                 }
                 .padding(.horizontal)
 
@@ -243,6 +350,23 @@ struct ContentView: View {
                                     .foregroundColor(.secondary)
                             }
                             Spacer()
+                            HStack(spacing: 6) {
+                                Button {
+                                    clipboard.togglePin(entry)
+                                } label: {
+                                    Image(systemName: entry.pinned ? "pin.fill" : "pin")
+                                }
+                                .buttonStyle(PlainButtonStyle())
+                                .help(entry.pinned ? "Unpin" : "Pin")
+
+                                Button(role: .destructive) {
+                                    clipboard.deleteEntry(entry)
+                                } label: {
+                                    Image(systemName: "trash")
+                                }
+                                .buttonStyle(PlainButtonStyle())
+                                .help("Delete")
+                            }
                         }
                         .contentShape(Rectangle())
                         .onTapGesture {
@@ -271,7 +395,7 @@ struct ContentView: View {
                 }
                 .frame(minWidth: 400, minHeight: 550)
                 .cornerRadius(20)
-                .overlay( /// apply a rounded border
+                .overlay(
                     RoundedRectangle(cornerRadius: 20)
                         .stroke(lineWidth: 0)
                 )
@@ -296,6 +420,14 @@ struct ContentView: View {
         .sheet(isPresented: $clipboard.showSettingsSheet) {
             SettingsView()
                 .environmentObject(clipboard)
+        }
+        .alert("Clear All?", isPresented: $clipboard.showClearAllConfirmation) {
+            Button("Cancel", role: .cancel) {}
+            Button("Clear All", role: .destructive) {
+                clipboard.clearAll()
+            }
+        } message: {
+            Text("This will remove all clipboard history entries.")
         }
     }
 }
@@ -343,7 +475,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
     
     @objc func statusItemLeftClick(_ sender: NSStatusBarButton) {
-        // Detect if left or right click
         let event = NSApp.currentEvent!
         
         if event.type == .rightMouseUp {
